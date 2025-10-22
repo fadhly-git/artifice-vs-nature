@@ -1,0 +1,198 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===========================
+# Virtual Environments
+# ===========================
+.venv/
+.venv
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+conda-meta/
+
+# ===========================
+# Jupyter Notebook
+# ===========================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.virtual_documents/
+
+# ===========================
+# Data Files (Large datasets)
+# ===========================
+data/raw/
+data/processed/
+*.csv
+*.h5
+*.hdf5
+*.parquet
+*.feather
+
+# Keep structure but ignore content
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ===========================
+# Model Checkpoints & Weights
+# ===========================
+models/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pb
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.weights
+
+# Keep structure but ignore content
+!models/checkpoints/.gitkeep
+
+# ===========================
+# Results & Outputs
+# ===========================
+results/logs/
+results/figures/
+results/metrics/
+*.log
+*.out
+
+# Keep structure but ignore content
+!results/logs/.gitkeep
+!results/figures/.gitkeep
+!results/metrics/.gitkeep
+
+# ===========================
+# IDE & Editors
+# ===========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ===========================
+# OS Files
+# ===========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+.directory
+
+# ===========================
+# Testing & Coverage
+# ===========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ===========================
+# MyPy & Type Checking
+# ===========================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ===========================
+# Environment & Secrets
+# ===========================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.yml
+config.local.yml
+
+# ===========================
+# Temporary Files
+# ===========================
+*.tmp
+*.temp
+*.bak
+*.swp
+*~.nib
+tmp/
+temp/
+
+# ===========================
+# MLflow & Experiment Tracking
+# ===========================
+mlruns/
+mlflow/
+.mlflow/
+
+# ===========================
+# Weights & Biases
+# ===========================
+wandb/
+
+# ===========================
+# TensorBoard
+# ===========================
+runs/
+logs/
+events.out.tfevents.*
+
+# ===========================
+# Docker
+# ===========================
+*.dockerignore
+docker-compose.override.yml
+
+# ===========================
+# Compressed Files
+# ===========================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
