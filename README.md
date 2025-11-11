@@ -122,13 +122,12 @@ git clone https://github.com/fadhly-git/artifice-vs-nature.git
 cd artifice-vs-nature
 ```
 
-### Step 2: Copy PyTorch Wheels
+### Step 2: Download PyTorch Wheels
 
-```bash
-# Copy wheels from models/ to lib/
-cp models/torch-1.7.0a0-cp38-cp38-linux_x86_64.whl lib/
-cp models/torchvision-0.8.0a0+2f40a48-cp38-cp38-linux_x86_64.whl lib/
-```
+- **torch-1.7.0a0 (ROCm 3.5)**: [torch-1.7.0a0-cp38-cp38-linux_x86_64.whl](https://github.com/xuhuisheng/rocm-gfx803/releases/download/rocm35/torch-1.7.0a0-cp38-cp38-linux_x86_64.whl)  
+- **torchvision-0.8.0a0**: [torchvision-0.8.0a0+2f40a48-cp38-cp38-linux_x86_64.whl](https://github.com/xuhuisheng/rocm-gfx803/releases/download/rocm35/torchvision-0.8.0a0+2f40a48-cp38-cp38-linux_x86_64.whl) 
+
+move to ```lib/```
 
 ### Step 3: Install Dependencies
 

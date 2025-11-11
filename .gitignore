@@ -196,3 +196,8 @@ docker-compose.override.yml
 *.tgz
 *.rar
 *.7z
+
+# Large PyTorch wheel files (too big for GitHub)
+*.whl
+models/*.whl
+lib/*.whl
