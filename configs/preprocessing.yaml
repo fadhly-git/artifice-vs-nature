@@ -1,0 +1,21 @@
+# Preprocessing configuration for Artifice vs Nature
+
+jpeg:
+  prob: 0.7
+  quality_range: [30, 90]
+
+mask:
+  ratio: 0.2
+
+dct:
+  top_k: 1024
+  block_size: 8
+
+augmentation:
+  horizontal_flip_prob: 0.5
+  brightness_range: [-0.2, 0.2]
+  contrast_range: [-0.2, 0.2]
+
+normalization:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]

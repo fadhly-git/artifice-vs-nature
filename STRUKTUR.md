@@ -10,6 +10,7 @@ artifice-vs-nature.git/
 ├── 📁 models/
 │   └── 📁 checkpoints/
 ├── 📁 notebooks/
+├── 📁 docs/
 ├── 📁 results/
 │   ├── 📁 figures/
 │   ├── 📁 logs/
