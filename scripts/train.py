@@ -35,8 +35,10 @@ parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worke
 parser.add_argument('--freeze-cnn', action='store_true', help='Freeze CNN backbone')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
 parser.add_argument('--shutdown', action='store_true', help='Shutdown system after training completes')
+parser.add_argument('--accum-steps', type=int, default=1, help='Gradient accumulation steps')
 args = parser.parse_args()
 
+ACCUM_STEPS = args.accum_steps
 BATCH_SIZE = args.batch_size
 EPOCHS = args.epochs
 USE_AMP = args.amp
@@ -137,39 +139,53 @@ for epoch in range(start_epoch, EPOCHS):
     train_correct = 0
     train_total = 0
     
+    optimizer.zero_grad()  # Initialize gradients at start of epoch
+    
     pbar = tqdm(train_loader, desc=f"[TRAIN] Epoch {epoch+1}/{EPOCHS}", ncols=100)
     
-    for img_masked, dct_feat, labels in pbar:
+    for batch_idx, (img_masked, dct_feat, labels) in enumerate(pbar):
         img_masked = img_masked.to(DEVICE, non_blocking=True)
         dct_feat = dct_feat.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
         
-        optimizer.zero_grad()
-        
         with autocast(enabled=USE_AMP):
             outputs = model(img_masked, dct_feat)
             loss = criterion(outputs, labels)
+            
+            # Scale loss by accumulation steps for proper gradient averaging
+            if ACCUM_STEPS > 1:
+                loss = loss / ACCUM_STEPS
         
         if USE_AMP:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
         
-        train_loss += loss.item() * labels.size(0)
+        # Only update weights every ACCUM_STEPS batches
+        if (batch_idx + 1) % ACCUM_STEPS == 0:
+            if USE_AMP:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            
+            optimizer.zero_grad()
+        
+        # Accumulate metrics (un-scale loss for logging)
+        train_loss += loss.item() * labels.size(0) * ACCUM_STEPS
         _, predicted = outputs.max(1)
         train_total += labels.size(0)
         train_correct += predicted.eq(labels).sum().item()
         
-        # Update progress bar
+        # Update progress bar with effective batch size
+        effective_batch = BATCH_SIZE * ACCUM_STEPS
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*train_correct/train_total:.2f}%'
+            'loss': f'{loss.item()*ACCUM_STEPS:.4f}',
+            'acc': f'{100.*train_correct/train_total:.2f}%',
+            'eff_bs': effective_batch
         })
     
     train_loss = train_loss / train_total
