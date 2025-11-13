@@ -201,3 +201,7 @@ docker-compose.override.yml
 *.whl
 models/*.whl
 lib/*.whl
+ 
+# log
+results/*.txt
+results/**/*.txt
