@@ -35,13 +35,15 @@ parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worke
 parser.add_argument('--freeze-cnn', action='store_true', help='Freeze CNN backbone')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
 parser.add_argument('--shutdown', action='store_true', help='Shutdown system after training completes')
+parser.add_argument('--fast-mode', action='store_true', help='Use minimal augmentation (faster preprocessing)')
 parser.add_argument('--accum-steps', type=int, default=1, help='Gradient accumulation steps')
+parser.add_argument('--gpu-aug', action='store_true', help='Use GPU-based augmentation (Kornia, MUCH faster!)')
 args = parser.parse_args()
 
-ACCUM_STEPS = args.accum_steps
 BATCH_SIZE = args.batch_size
 EPOCHS = args.epochs
 USE_AMP = args.amp
+ACCUM_STEPS = args.accum_steps
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Set seeds for reproducibility
@@ -52,7 +54,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset import create_dataloaders
+from src.data.dataset import create_dataloaders, get_gpu_augmentation
 from src.models.hybrid import HybridDetector
 
 # ================== PATHS ==================
@@ -76,8 +78,19 @@ train_loader, val_loader = create_dataloaders(
     batch_size=BATCH_SIZE,
     num_workers=args.num_workers,
     train_ratio=0.8,
-    seed=args.seed
+    seed=args.seed,
+    fast_mode=args.fast_mode,
+    use_gpu_aug=args.gpu_aug
 )
+
+# Create GPU augmentation pipeline if enabled
+if args.gpu_aug:
+    train_gpu_aug = get_gpu_augmentation(is_training=True, device=DEVICE)
+    val_gpu_aug = get_gpu_augmentation(is_training=False, device=DEVICE)
+    log_print("✓ GPU augmentation enabled (Kornia)")
+else:
+    train_gpu_aug = None
+    val_gpu_aug = None
 
 # ================== MODEL ==================
 log_print("\n" + "="*60)
@@ -125,9 +138,13 @@ log_print("="*60)
 log_print(f"\nConfig:")
 log_print(f"   Device: {DEVICE}")
 log_print(f"   Batch size: {BATCH_SIZE}")
+log_print(f"   Accumulation steps: {ACCUM_STEPS}")
+log_print(f"   Effective batch size: {BATCH_SIZE * ACCUM_STEPS}")
 log_print(f"   Learning rate: {args.lr}")
 log_print(f"   Epochs: {EPOCHS}")
 log_print(f"   Mixed precision: {USE_AMP}")
+log_print(f"   Fast mode: {args.fast_mode}")
+log_print(f"   GPU augmentation: {args.gpu_aug}")
 log_print(f"   Seed: {args.seed}")
 log_print(f"   Freeze CNN: {args.freeze_cnn}")
 log_print("")
@@ -139,53 +156,44 @@ for epoch in range(start_epoch, EPOCHS):
     train_correct = 0
     train_total = 0
     
-    optimizer.zero_grad()  # Initialize gradients at start of epoch
-    
     pbar = tqdm(train_loader, desc=f"[TRAIN] Epoch {epoch+1}/{EPOCHS}", ncols=100)
     
-    for batch_idx, (img_masked, dct_feat, labels) in enumerate(pbar):
+    for img_masked, dct_feat, labels in pbar:
         img_masked = img_masked.to(DEVICE, non_blocking=True)
         dct_feat = dct_feat.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
         
+        # Apply GPU augmentation if enabled (MUCH faster than CPU!)
+        if train_gpu_aug is not None:
+            with torch.no_grad():
+                img_masked = train_gpu_aug(img_masked)
+        
+        optimizer.zero_grad()
+        
         with autocast(enabled=USE_AMP):
             outputs = model(img_masked, dct_feat)
             loss = criterion(outputs, labels)
-            
-            # Scale loss by accumulation steps for proper gradient averaging
-            if ACCUM_STEPS > 1:
-                loss = loss / ACCUM_STEPS
         
         if USE_AMP:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
         else:
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
-        # Only update weights every ACCUM_STEPS batches
-        if (batch_idx + 1) % ACCUM_STEPS == 0:
-            if USE_AMP:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            
-            optimizer.zero_grad()
-        
-        # Accumulate metrics (un-scale loss for logging)
-        train_loss += loss.item() * labels.size(0) * ACCUM_STEPS
+        train_loss += loss.item() * labels.size(0)
         _, predicted = outputs.max(1)
         train_total += labels.size(0)
         train_correct += predicted.eq(labels).sum().item()
         
-        # Update progress bar with effective batch size
-        effective_batch = BATCH_SIZE * ACCUM_STEPS
+        # Update progress bar
         pbar.set_postfix({
-            'loss': f'{loss.item()*ACCUM_STEPS:.4f}',
-            'acc': f'{100.*train_correct/train_total:.2f}%',
-            'eff_bs': effective_batch
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100.*train_correct/train_total:.2f}%'
         })
     
     train_loss = train_loss / train_total
@@ -204,6 +212,10 @@ for epoch in range(start_epoch, EPOCHS):
             img_masked = img_masked.to(DEVICE, non_blocking=True)
             dct_feat = dct_feat.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
+            
+            # Apply GPU normalization if enabled
+            if val_gpu_aug is not None:
+                img_masked = val_gpu_aug(img_masked)
             
             with autocast(enabled=USE_AMP):
                 outputs = model(img_masked, dct_feat)
