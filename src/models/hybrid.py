@@ -8,11 +8,23 @@ class HybridDetector(nn.Module):
     def __init__(self, num_classes=2, dct_dim=1024, pretrained=True, freeze_cnn=False):
         super().__init__()
         
+        # Load EfficientNet-B0 with better error handling (PyTorch 1.11+ compatible)
         try:
-            self.cnn = timm.create_model('efficientnet_b0', pretrained=pretrained, num_classes=0)
-        except:
-            print("Pretrained failed, using random init")
-            self.cnn = timm.create_model('efficientnet_b0', pretrained=False, num_classes=0)
+            self.cnn = timm.create_model(
+                'efficientnet_b0', 
+                pretrained=pretrained, 
+                num_classes=0,
+                drop_rate=0.2  # Add dropout for better regularization
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load pretrained weights: {e}")
+            print("⚠️  Pretrained failed, using random init")
+            self.cnn = timm.create_model(
+                'efficientnet_b0', 
+                pretrained=False, 
+                num_classes=0,
+                drop_rate=0.2
+            )
         
         if freeze_cnn:
             for param in self.cnn.parameters():

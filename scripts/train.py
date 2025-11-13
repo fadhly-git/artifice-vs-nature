@@ -1,8 +1,40 @@
+"""
+Hybrid Detector Training Script
+================================
+
+Trains a hybrid model combining CNN (EfficientNet-B0) and DCT features
+for AI-generated image detection.
+
+PyTorch Compatibility:
+- PyTorch 1.7.0 (ROCm 3.5) - Legacy support
+- PyTorch 1.11+ (CUDA 11.3+, ROCm 5.0+) - Recommended
+
+The script automatically detects PyTorch version and uses appropriate APIs.
+
+Usage:
+    # Quick test
+    python scripts/train.py --batch-size 8 --epochs 2 --amp
+    
+    # Full training
+    python scripts/train.py --batch-size 16 --epochs 50 --amp --gpu-aug
+    
+    # Resume training
+    python scripts/train.py --resume --epochs 100
+"""
+
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+
+# PyTorch 1.11+ compatibility with automatic fallback to 1.7
+try:
+    from torch.amp import autocast, GradScaler
+    TORCH_AMP_AVAILABLE = True
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
+    TORCH_AMP_AVAILABLE = False
+
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
 import sys
@@ -42,9 +74,12 @@ args = parser.parse_args()
 
 BATCH_SIZE = args.batch_size
 EPOCHS = args.epochs
-USE_AMP = args.amp
+USE_AMP = args.amp and torch.cuda.is_available()  # Only use AMP with CUDA
 ACCUM_STEPS = args.accum_steps
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Determine device type for autocast (PyTorch 1.11+ compatibility)
+AUTOCAST_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Set seeds for reproducibility
 torch.manual_seed(args.seed)
@@ -65,6 +100,19 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 LATEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_latest.pth"
 BEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_best.pth"
+
+# ================== SYSTEM INFO ==================
+log_print("\n" + "="*60)
+log_print("🔧 SYSTEM INFORMATION")
+log_print("="*60)
+log_print(f"PyTorch version: {torch.__version__}")
+log_print(f"PyTorch AMP API: {'torch.amp (1.11+)' if TORCH_AMP_AVAILABLE else 'torch.cuda.amp (1.7)'}")
+log_print(f"Device: {DEVICE}")
+if torch.cuda.is_available():
+    log_print(f"GPU: {torch.cuda.get_device_name(0)}")
+    log_print(f"CUDA version: {torch.version.cuda}")
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    log_print(f"GPU memory: {mem_gb:.2f} GB")
 
 # ================== DATASET ==================
 log_print("\n" + "="*60)
@@ -170,9 +218,15 @@ for epoch in range(start_epoch, EPOCHS):
         
         optimizer.zero_grad()
         
-        with autocast(enabled=USE_AMP):
-            outputs = model(img_masked, dct_feat)
-            loss = criterion(outputs, labels)
+        # Updated autocast for PyTorch 1.11+ (with fallback for 1.7)
+        if TORCH_AMP_AVAILABLE:
+            with autocast(device_type=AUTOCAST_DEVICE, enabled=USE_AMP):
+                outputs = model(img_masked, dct_feat)
+                loss = criterion(outputs, labels)
+        else:
+            with autocast(enabled=USE_AMP):
+                outputs = model(img_masked, dct_feat)
+                loss = criterion(outputs, labels)
         
         if USE_AMP:
             scaler.scale(loss).backward()
@@ -217,9 +271,15 @@ for epoch in range(start_epoch, EPOCHS):
             if val_gpu_aug is not None:
                 img_masked = val_gpu_aug(img_masked)
             
-            with autocast(enabled=USE_AMP):
-                outputs = model(img_masked, dct_feat)
-                loss = criterion(outputs, labels)
+            # Updated autocast for PyTorch 1.11+ (with fallback for 1.7)
+            if TORCH_AMP_AVAILABLE:
+                with autocast(device_type=AUTOCAST_DEVICE, enabled=USE_AMP):
+                    outputs = model(img_masked, dct_feat)
+                    loss = criterion(outputs, labels)
+            else:
+                with autocast(enabled=USE_AMP):
+                    outputs = model(img_masked, dct_feat)
+                    loss = criterion(outputs, labels)
             
             val_loss += loss.item() * labels.size(0)
             _, predicted = outputs.max(1)

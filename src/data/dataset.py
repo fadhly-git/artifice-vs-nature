@@ -16,6 +16,11 @@ class HybridDataset(Dataset):
         dct_dir: Path ke folder berisi file DCT features (.npy)
         transform: Transformasi untuk training/validation
         is_training: Boolean untuk menentukan apakah mode training (dengan augmentasi)
+    
+    Notes:
+        - DCT features loaded with memory-mapped I/O for efficiency
+        - Arrays are copied to writable format for PyTorch compatibility (v1.11+)
+        - Supports both 'real' (label=0) and 'fake' (label=1) images
     """
     def __init__(self, root_dir, dct_dir=None, transform=None, is_training=True):
         self.root_dir = Path(root_dir)
@@ -75,8 +80,9 @@ class HybridDataset(Dataset):
         if self.dct_dir:
             dct_path = self.dct_dir / f"{img_path.stem}.npy"
             if dct_path.exists():
-                # Use mmap for faster .npy loading (no full file read)
-                dct_feat = torch.from_numpy(np.load(dct_path, mmap_mode='r')).float().clone()
+                # Load with mmap and copy to writable array (fixes PyTorch warning)
+                dct_array = np.load(dct_path, mmap_mode='r')
+                dct_feat = torch.from_numpy(np.array(dct_array, copy=True)).float()
             else:
                 # Fallback: zero tensor
                 dct_feat = torch.zeros(1024)
@@ -235,31 +241,69 @@ def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0,
     return train_loader, val_loader
 
 
+class PyTorchGPUAugment(nn.Module):
+    """
+    Pure PyTorch GPU augmentation (NO MAGMA required - ROCm compatible!)
+    Input: x tensor shape (B, C, H, W), values in [0..1] float
+    """
+    def __init__(self, is_training=True, device='cuda'):
+        super().__init__()
+        self.is_training = is_training
+        self.device = device
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def random_horizontal_flip(self, x, p=0.5):
+        if self.is_training and torch.rand(1, device=x.device) < p:
+            return torch.flip(x, dims=[-1])
+        return x
+
+    def color_jitter(self, x, brightness=0.2, contrast=0.2, saturation=0.2):
+        if not self.is_training:
+            return x
+        # brightness
+        if brightness > 0:
+            b = 1.0 + (torch.rand(1, device=x.device) * 2 - 1) * brightness
+            x = x * b
+        # contrast
+        if contrast > 0:
+            c = 1.0 + (torch.rand(1, device=x.device) * 2 - 1) * contrast
+            mean = x.mean(dim=[2,3], keepdim=True)
+            x = (x - mean) * c + mean
+        # saturation
+        if saturation > 0:
+            s = 1.0 + (torch.rand(1, device=x.device) * 2 - 1) * saturation
+            gray = (0.2989*x[:,0:1,:,:] + 0.5870*x[:,1:2,:,:] + 0.1140*x[:,2:3,:,:])
+            x = (x - gray) * s + gray
+        return x.clamp(0.0, 1.0)
+
+    def gaussian_blur(self, x, kernel_size=3, sigma=1.0, p=0.3):
+        if not self.is_training or torch.rand(1, device=x.device) >= p:
+            return x
+        half = kernel_size // 2
+        coords = torch.arange(-half, half+1, device=x.device, dtype=torch.float32)
+        g = torch.exp(-(coords**2) / (2 * (sigma**2)))
+        g = g / g.sum()
+        kernel_2d = g[:,None] * g[None,:]
+        kernel_2d = kernel_2d.expand(x.shape[1], 1, kernel_size, kernel_size)
+        import torch.nn.functional as F
+        x = F.conv2d(x, kernel_2d, padding=half, groups=x.shape[1])
+        return x
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def forward(self, x):
+        x = self.random_horizontal_flip(x, p=0.5)
+        x = self.color_jitter(x, brightness=0.15, contrast=0.15, saturation=0.15)
+        x = self.gaussian_blur(x, kernel_size=3, sigma=1.0, p=0.3)
+        x = self.normalize(x)
+        return x
+
+
 def get_gpu_augmentation(is_training=True, device='cuda'):
     """
-    GPU-based augmentation using Kornia (ROCm compatible - NO MAGMA!)
+    Get pure PyTorch GPU augmentation (NO Kornia, NO MAGMA!)
+    Works with ROCm 3.5 and older PyTorch versions.
     """
-    import kornia.augmentation as K
-    
-    if is_training:
-        return nn.Sequential(
-            # ❌ REMOVE RandomRotation (needs MAGMA!)
-            # K.RandomRotation(degrees=15, p=0.5),
-            
-            # ✅ KEEP these (no matrix inversion needed):
-            K.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-            K.RandomHorizontalFlip(p=0.5),
-            K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.3),
-            
-            # Normalization (always needed)
-            K.Normalize(
-                mean=torch.tensor([0.485, 0.456, 0.406]),
-                std=torch.tensor([0.229, 0.224, 0.225])
-            )
-        ).to(device)
-    else:
-        # Validation: only normalize
-        return K.Normalize(
-            mean=torch.tensor([0.485, 0.456, 0.406]),
-            std=torch.tensor([0.229, 0.224, 0.225])
-        ).to(device)
+    return PyTorchGPUAugment(is_training=is_training, device=device).to(device)
