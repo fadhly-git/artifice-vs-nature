@@ -2,11 +2,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, ConcatDataset
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
-import timm
 import sys
 import argparse
 from tqdm import tqdm
@@ -15,34 +13,36 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # ================== ARGUMENTS ==================
-parser = argparse.ArgumentParser()
-parser.add_argument('--batch-size', type=int, default=4)
-parser.add_argument('--accum-steps', type=int, default=8)
-parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--epochs', type=int, default=25)
-parser.add_argument('--resume', action='store_true')
-parser.add_argument('--amp', action='store_true', default=True)
-parser.add_argument('--num-workers', type=int, default=0)
-parser.add_argument('--subset', type=float, default=None)
-parser.add_argument('--freeze-cnn', action='store_true')
+parser = argparse.ArgumentParser(description='Train Hybrid Detector with on-the-fly preprocessing')
+parser.add_argument('--batch-size', type=int, default=4, help='Batch size per step')
+parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
+parser.add_argument('--num-workers', type=int, default=0, help='DataLoader workers (use 0 for ROCm)')
+parser.add_argument('--freeze-cnn', action='store_true', help='Freeze CNN backbone')
+parser.add_argument('--seed', type=int, default=42, help='Random seed')
 args = parser.parse_args()
 
 BATCH_SIZE = args.batch_size
-ACCUM_STEPS = args.accum_steps
 EPOCHS = args.epochs
 USE_AMP = args.amp
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Set seeds for reproducibility
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset import HybridDataset
+from src.data.dataset import create_dataloaders
 from src.models.hybrid import HybridDetector
 
 # ================== PATHS ==================
-FAKE_DIR = PROJECT_ROOT / "data" / "processed" / "imaginet" / "subset_pt" / "fake"
-REAL_DIR = PROJECT_ROOT / "data" / "processed" / "imaginet" / "subset_pt" / "real"
+DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "imaginet" / "subset"
+DCT_DIR = PROJECT_ROOT / "data" / "processed" / "imaginet" / "dct_features"  # Optional
 CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -50,139 +50,190 @@ LATEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_latest.pth"
 BEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_best.pth"
 
 # ================== DATASET ==================
-fake_dataset = HybridDataset(FAKE_DIR)
-real_dataset = HybridDataset(REAL_DIR)
+print("\n" + "="*60)
+print("📁 LOADING DATASET")
+print("="*60)
 
-if args.subset is not None and 0.0 < args.subset < 1.0:
-    import random
-    from torch.utils.data import Subset
-    fake_indices = list(range(len(fake_dataset)))
-    real_indices = list(range(len(real_dataset)))
-    random.shuffle(fake_indices)
-    random.shuffle(real_indices)
-    fake_size = int(len(fake_dataset) * args.subset)
-    real_size = int(len(real_dataset) * args.subset)
-    fake_dataset = Subset(fake_dataset, fake_indices[:fake_size])
-    real_dataset = Subset(real_dataset, real_indices[:real_size])
-
-full_dataset = ConcatDataset([real_dataset, fake_dataset])
-
-print(f"\nDataset Info:")
-print(f"   Fake: {len(fake_dataset)} | Real: {len(real_dataset)} | Total: {len(full_dataset)}")
-if args.subset:
-    print(f"   Using {args.subset*100:.0f}% subset")
-
-dataloader = DataLoader(
-    full_dataset,
+# Create dataloaders with automatic 80/20 split
+train_loader, val_loader = create_dataloaders(
+    root_dir=DATA_ROOT,
+    dct_dir=DCT_DIR if DCT_DIR.exists() else None,
     batch_size=BATCH_SIZE,
-    shuffle=True,
     num_workers=args.num_workers,
-    pin_memory=True if torch.cuda.is_available() else False,
-    drop_last=True,
-    persistent_workers=False,
-    prefetch_factor=2
+    train_ratio=0.8,
+    seed=args.seed
 )
 
 # ================== MODEL ==================
+print("\n" + "="*60)
+print("🤖 INITIALIZING MODEL")
+print("="*60)
+
 model = HybridDetector(num_classes=2, pretrained=True, freeze_cnn=args.freeze_cnn).to(DEVICE)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Model: {trainable:,} trainable params")
+total = sum(p.numel() for p in model.parameters())
+print(f"Model: {trainable:,} trainable / {total:,} total params")
 
 # ================== OPTIMIZER + SCHEDULER ==================
 optimizer = optim.Adam([
-    {'params': model.mlp.parameters(), 'lr': args.lr},           # DCT head
-    {'params': model.classifier.parameters(), 'lr': args.lr},    # Classifier
-    {'params': model.cnn.parameters(), 'lr': args.lr / 10}       # CNN: 10x lebih kecil
+    {'params': model.mlp.parameters(), 'lr': args.lr},
+    {'params': model.classifier.parameters(), 'lr': args.lr},
+    {'params': model.cnn.parameters(), 'lr': args.lr / 10}
 ], lr=args.lr)
 
-scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)  # 25 epoch
-
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 scaler = GradScaler() if USE_AMP else None
+criterion = nn.CrossEntropyLoss()
 
 # ================== RESUME ==================
 start_epoch = 0
-best_acc = 0.0
+best_val_acc = 0.0
 
 if args.resume and LATEST_CHECKPOINT.exists():
-    print(f"Resuming from {LATEST_CHECKPOINT}")
+    print(f"\n📂 Resuming from {LATEST_CHECKPOINT}")
     checkpoint = torch.load(LATEST_CHECKPOINT, map_location=DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch'] + 1
-    best_acc = checkpoint.get('best_acc', 0.0)
-    # Reload scheduler state
+    best_val_acc = checkpoint.get('best_val_acc', 0.0)
     if 'scheduler' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler'])
-    print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
+    print(f"✅ Resumed from epoch {start_epoch}, best val acc: {best_val_acc:.2f}%")
 
 torch.backends.cudnn.benchmark = True
 
 # ================== TRAINING LOOP ==================
-for epoch in range(start_epoch, EPOCHS):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    optimizer.zero_grad()
-    
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=100)
+print("\n" + "="*60)
+print("🚀 STARTING TRAINING")
+print("="*60)
+print(f"\nConfig:")
+print(f"   Device: {DEVICE}")
+print(f"   Batch size: {BATCH_SIZE}")
+print(f"   Learning rate: {args.lr}")
+print(f"   Epochs: {EPOCHS}")
+print(f"   Mixed precision: {USE_AMP}")
+print(f"   Seed: {args.seed}")
+print()
 
-    for batch_idx, (img_masked, dct_feat, labels) in enumerate(pbar):
+for epoch in range(start_epoch, EPOCHS):
+    # ========== TRAINING PHASE ==========
+    model.train()
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
+    
+    pbar = tqdm(train_loader, desc=f"[TRAIN] Epoch {epoch+1}/{EPOCHS}", ncols=100)
+    
+    for img_masked, dct_feat, labels in pbar:
         img_masked = img_masked.to(DEVICE, non_blocking=True)
         dct_feat = dct_feat.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
-
+        
+        optimizer.zero_grad()
+        
         with autocast(enabled=USE_AMP):
             outputs = model(img_masked, dct_feat)
-            loss = nn.CrossEntropyLoss()(outputs, labels) / ACCUM_STEPS
-
+            loss = criterion(outputs, labels)
+        
         if USE_AMP:
             scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
             loss.backward()
-
-        if (batch_idx + 1) % ACCUM_STEPS == 0 or (batch_idx + 1) == len(dataloader):
-            if USE_AMP:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-
-        running_loss += loss.item() * ACCUM_STEPS
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+            optimizer.step()
         
+        train_loss += loss.item() * labels.size(0)
+        _, predicted = outputs.max(1)
+        train_total += labels.size(0)
+        train_correct += predicted.eq(labels).sum().item()
+        
+        # Update progress bar
         pbar.set_postfix({
-            'loss': f'{running_loss/(batch_idx+1):.4f}',
-            'acc': f'{100.*correct/total:.2f}%',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100.*train_correct/train_total:.2f}%'
         })
-
-    pbar.close()
-
-    # Step scheduler
+    
+    train_loss = train_loss / train_total
+    train_acc = 100. * train_correct / train_total
+    
+    # ========== VALIDATION PHASE ==========
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+    
+    with torch.no_grad():
+        pbar_val = tqdm(val_loader, desc=f"[VAL]   Epoch {epoch+1}/{EPOCHS}", ncols=100)
+        
+        for img_masked, dct_feat, labels in pbar_val:
+            img_masked = img_masked.to(DEVICE, non_blocking=True)
+            dct_feat = dct_feat.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+            
+            with autocast(enabled=USE_AMP):
+                outputs = model(img_masked, dct_feat)
+                loss = criterion(outputs, labels)
+            
+            val_loss += loss.item() * labels.size(0)
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+            
+            pbar_val.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100.*val_correct/val_total:.2f}%'
+            })
+    
+    val_loss = val_loss / val_total
+    val_acc = 100. * val_correct / val_total
+    
+    # Update learning rate
     scheduler.step()
-
-    epoch_loss = running_loss / len(dataloader)
-    epoch_acc = 100. * correct / total
-
-    # Save checkpoint
-    checkpoint = {
+    
+    # ========== LOGGING ==========
+    print(f"\n📊 Epoch {epoch+1}/{EPOCHS} Summary:")
+    print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+    print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+    print(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
+    
+    # ========== SAVE CHECKPOINTS ==========
+    # Save latest checkpoint
+    torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
-        'loss': epoch_loss,
-        'accuracy': epoch_acc,
-        'best_acc': best_acc
-    }
-    torch.save(checkpoint, LATEST_CHECKPOINT)
+        'train_loss': train_loss,
+        'train_acc': train_acc,
+        'val_loss': val_loss,
+        'val_acc': val_acc,
+        'best_val_acc': best_val_acc
+    }, LATEST_CHECKPOINT)
+    
+    # Save best checkpoint
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'val_acc': val_acc,
+            'val_loss': val_loss
+        }, BEST_CHECKPOINT)
+        print(f"   🌟 New best validation accuracy: {val_acc:.2f}% - Checkpoint saved!")
+    
+    print()
+    
+    # Clear cache every epoch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    if epoch_acc > best_acc:
-        best_acc = epoch_acc
-        torch.save(checkpoint, BEST_CHECKPOINT)
-        print(f"NEW BEST: {best_acc:.2f}%")
-
-    print(f"Epoch {epoch+1} | Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
+# ================== TRAINING COMPLETE ==================
+print("\n" + "="*60)
+print("✅ TRAINING COMPLETE")
+print("="*60)
+print(f"\nBest validation accuracy: {best_val_acc:.2f}%")
+print(f"Checkpoints saved in: {CHECKPOINT_DIR}")
+print(f"   - Latest: {LATEST_CHECKPOINT.name}")
+print(f"   - Best: {BEST_CHECKPOINT.name}")
