@@ -10,6 +10,7 @@ import argparse
 from tqdm import tqdm
 import ssl
 from datetime import datetime
+import subprocess
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -28,26 +29,42 @@ parser = argparse.ArgumentParser(description='Train Hybrid Detector with on-the-
 parser.add_argument('--batch-size', type=int, default=4, help='Batch size per step')
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-parser.add_argument('--epoch', type=int, dest='epochs', help='Alias for --epochs')
 parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
-parser.add_argument('--amp', type=lambda x: str(x).lower() in ('true','1','yes','y'), default=True, help='Use mixed precision (True/False)')
+parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
 parser.add_argument('--num-workers', type=int, default=0, help='DataLoader workers (use 0 for ROCm)')
 parser.add_argument('--freeze-cnn', action='store_true', help='Freeze CNN backbone')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
 parser.add_argument('--shutdown', action='store_true', help='Shutdown system after training completes')
+parser.add_argument('--unfreeze-epoch', type=int, default=10, help='Epoch to unfreeze CNN (default: 10)')
+parser.add_argument('--cnn-lr-ratio', type=float, default=0.01, help='CNN LR ratio after unfreeze (default: 0.01)')
 args = parser.parse_args()
 
 BATCH_SIZE = args.batch_size
 EPOCHS = args.epochs
 USE_AMP = args.amp
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+UNFREEZE_EPOCH = args.unfreeze_epoch
+CNN_LR_RATIO = args.cnn_lr_ratio
+
+# Create logs directory
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+LOG_DIR = PROJECT_ROOT / "results" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Create log file with timestamp
+LOG_FILE = LOG_DIR / f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+def log_print(message):
+    """Print to console and save to log file"""
+    print(message)
+    with open(LOG_FILE, "a") as f:
+        f.write(message + "\n")
 
 # Set seeds for reproducibility
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import create_dataloaders
@@ -74,7 +91,9 @@ train_loader, val_loader = create_dataloaders(
     batch_size=BATCH_SIZE,
     num_workers=args.num_workers,
     train_ratio=0.8,
-    seed=args.seed
+    seed=args.seed,
+    current_epoch=0,  # Will be updated in training loop
+    max_epochs=EPOCHS
 )
 
 # ================== MODEL ==================
@@ -82,22 +101,32 @@ log_print("\n" + "="*60)
 log_print("🤖 INITIALIZING MODEL")
 log_print("="*60)
 
-model = HybridDetector(num_classes=2, pretrained=True, freeze_cnn=args.freeze_cnn).to(DEVICE)
+# Always start with frozen CNN for stable training
+model = HybridDetector(num_classes=2, pretrained=True, freeze_cnn=True).to(DEVICE)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
 log_print(f"Model: {trainable:,} trainable / {total:,} total params")
 
+if not args.freeze_cnn:
+    log_print(f"🔒 CNN will be unfrozen at epoch {UNFREEZE_EPOCH + 1}")
+    log_print(f"   CNN LR ratio after unfreeze: {CNN_LR_RATIO}x")
+else:
+    log_print(f"🔒 CNN will remain frozen (--freeze-cnn flag set)")
+
 # ================== OPTIMIZER + SCHEDULER ==================
+# Start with only MLP and classifier trainable
 optimizer = optim.Adam([
     {'params': model.mlp.parameters(), 'lr': args.lr},
-    {'params': model.classifier.parameters(), 'lr': args.lr},
-    {'params': model.cnn.parameters(), 'lr': args.lr / 10}
+    {'params': model.classifier.parameters(), 'lr': args.lr}
 ], lr=args.lr)
 
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 scaler = GradScaler() if USE_AMP else None
 criterion = nn.CrossEntropyLoss()
+
+# Track if CNN has been unfrozen
+cnn_unfrozen = False
 
 # ================== RESUME ==================
 start_epoch = 0
@@ -110,9 +139,11 @@ if args.resume and LATEST_CHECKPOINT.exists():
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch'] + 1
     best_val_acc = checkpoint.get('best_val_acc', 0.0)
+    cnn_unfrozen = checkpoint.get('cnn_unfrozen', False)
     if 'scheduler' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler'])
     log_print(f"✅ Resumed from epoch {start_epoch}, best val acc: {best_val_acc:.2f}%")
+    log_print(f"   CNN unfrozen status: {cnn_unfrozen}")
 
 torch.backends.cudnn.benchmark = True
 
@@ -127,10 +158,45 @@ log_print(f"   Learning rate: {args.lr}")
 log_print(f"   Epochs: {EPOCHS}")
 log_print(f"   Mixed precision: {USE_AMP}")
 log_print(f"   Seed: {args.seed}")
-log_print(f"   Freeze CNN: {args.freeze_cnn}")
+log_print(f"   Unfreeze epoch: {UNFREEZE_EPOCH + 1}")
+log_print(f"   CNN LR ratio: {CNN_LR_RATIO}x")
+log_print(f"   Shutdown after training: {args.shutdown}")
+log_print(f"   Log file: {LOG_FILE}")
 log_print("")
 
 for epoch in range(start_epoch, EPOCHS):
+    # ========== GRADUAL UNFREEZING ==========
+    if epoch == UNFREEZE_EPOCH and not cnn_unfrozen and not args.freeze_cnn:
+        log_print("\n" + "="*60)
+        log_print(f"🔓 UNFREEZING CNN AT EPOCH {epoch+1}")
+        log_print("="*60)
+        
+        # Unfreeze CNN
+        for param in model.cnn.parameters():
+            param.requires_grad = True
+        
+        # Recreate optimizer with CNN parameters
+        cnn_lr = args.lr * CNN_LR_RATIO
+        optimizer = optim.Adam([
+            {'params': model.mlp.parameters(), 'lr': args.lr},
+            {'params': model.classifier.parameters(), 'lr': args.lr},
+            {'params': model.cnn.parameters(), 'lr': cnn_lr}
+        ], lr=args.lr)
+        
+        # Reset scheduler for remaining epochs
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS - epoch)
+        
+        cnn_unfrozen = True
+        
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log_print(f"   Trainable params: {trainable:,}")
+        log_print(f"   MLP/Classifier LR: {args.lr:.2e}")
+        log_print(f"   CNN LR: {cnn_lr:.2e}")
+        log_print("="*60 + "\n")
+    
+    # Update dataloaders with current epoch for progressive JPEG
+    train_loader.dataset.current_epoch = epoch
+    
     # ========== TRAINING PHASE ==========
     model.train()
     train_loss = 0.0
@@ -153,11 +219,13 @@ for epoch in range(start_epoch, EPOCHS):
         if USE_AMP:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
@@ -226,7 +294,8 @@ for epoch in range(start_epoch, EPOCHS):
         'train_acc': train_acc,
         'val_loss': val_loss,
         'val_acc': val_acc,
-        'best_val_acc': best_val_acc
+        'best_val_acc': best_val_acc,
+        'cnn_unfrozen': cnn_unfrozen
     }, LATEST_CHECKPOINT)
     
     # Save best checkpoint
@@ -254,33 +323,32 @@ log_print(f"\nBest validation accuracy: {best_val_acc:.2f}%")
 log_print(f"Checkpoints saved in: {CHECKPOINT_DIR}")
 log_print(f"   - Latest: {LATEST_CHECKPOINT.name}")
 log_print(f"   - Best: {BEST_CHECKPOINT.name}")
-log_print(f"\n📝 Training log saved to: {LOG_FILE}")
+log_print(f"\nLog file saved: {LOG_FILE}")
+log_print(f"Training finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ================== AUTO SHUTDOWN ==================
+# ================== AUTOMATIC SHUTDOWN ==================
 if args.shutdown:
     log_print("\n" + "="*60)
-    log_print("🔌 SHUTTING DOWN SYSTEM IN 60 SECONDS...")
+    log_print("🔴 SYSTEM SHUTDOWN IN 10 SECONDS...")
     log_print("="*60)
-    log_print("Press Ctrl+C to cancel shutdown")
+    log_print("Press Ctrl+C to cancel shutdown.")
     
-    import subprocess
     import time
-    
-    # Countdown
-    for i in range(60, 0, -10):
-        log_print(f"   Shutdown in {i} seconds...")
-        time.sleep(10)
-    
-    log_print("\n🔴 Shutting down now...")
-    
-    # Try different shutdown methods (fallback if one fails)
     try:
-        # Method 1: systemctl (no password needed if configured)
-        subprocess.run(['sudo', 'systemctl', 'poweroff'], check=True)
-    except:
-        try:
-            # Method 2: shutdown command
-            subprocess.run(['sudo', 'shutdown', '-h', 'now'], check=True)
-        except:
-            # Method 3: poweroff
-            subprocess.run(['sudo', 'poweroff'], check=True)
+        for i in range(10, 0, -1):
+            print(f"Shutting down in {i}s...", end='\r')
+            time.sleep(1)
+        
+        log_print("\nInitiating system shutdown...")
+        
+        # Linux/Mac shutdown
+        if sys.platform in ['linux', 'darwin']:
+            os.system('sudo shutdown -h now')
+        # Windows shutdown
+        elif sys.platform == 'win32':
+            os.system('shutdown /s /t 0')
+    except KeyboardInterrupt:
+        log_print("\n⚠️  Shutdown cancelled by user")
+        sys.exit(0)
+else:
+    log_print("\nTo enable automatic shutdown, run with: --shutdown")
