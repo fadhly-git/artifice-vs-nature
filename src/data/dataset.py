@@ -5,6 +5,38 @@ from PIL import Image
 import torchvision.transforms as T
 import numpy as np
 import random
+import io
+from src.preprocessing.jpeg import apply_jpeg
+
+class ProgressiveJpegTransform:
+    """
+    Progressive JPEG compression augmentation.
+    Starts with high quality, gradually decreases as training progresses.
+    """
+    def __init__(self, current_epoch=0, max_epochs=50, prob=0.5):
+        self.current_epoch = current_epoch
+        self.max_epochs = max_epochs
+        self.prob = prob
+    
+    def __call__(self, img):
+        if random.random() > self.prob:
+            return img
+        
+        # Progressive quality range based on epoch
+        # Early epochs: quality 70-95 (mild compression)
+        # Later epochs: quality 30-90 (aggressive compression)
+        progress = min(1.0, self.current_epoch / (self.max_epochs * 0.6))
+        
+        min_quality = int(70 - 40 * progress)  # 70 -> 30
+        max_quality = int(95 - 5 * progress)   # 95 -> 90
+        
+        quality = random.randint(min_quality, max_quality)
+        
+        # Apply JPEG compression
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer).convert('RGB')
 
 class HybridDataset(Dataset):
     """
@@ -15,12 +47,22 @@ class HybridDataset(Dataset):
         dct_dir: Path ke folder berisi file DCT features (.npy)
         transform: Transformasi untuk training/validation
         is_training: Boolean untuk menentukan apakah mode training (dengan augmentasi)
+        current_epoch: Current training epoch for progressive augmentation
+        max_epochs: Total training epochs
+    
+    Notes:
+        - DCT features loaded with memory-mapped I/O for efficiency
+        - Arrays are copied to writable format for PyTorch compatibility (v1.11+)
+        - Supports both 'real' (label=0) and 'fake' (label=1) images
     """
-    def __init__(self, root_dir, dct_dir=None, transform=None, is_training=True):
+    def __init__(self, root_dir, dct_dir=None, transform=None, is_training=True, 
+                 current_epoch=0, max_epochs=50):
         self.root_dir = Path(root_dir)
         self.dct_dir = Path(dct_dir) if dct_dir else None
         self.transform = transform
         self.is_training = is_training
+        self.current_epoch = current_epoch
+        self.max_epochs = max_epochs
         
         # Collect all image files
         self.samples = []
@@ -72,7 +114,9 @@ class HybridDataset(Dataset):
         if self.dct_dir:
             dct_path = self.dct_dir / f"{img_path.stem}.npy"
             if dct_path.exists():
-                dct_feat = torch.from_numpy(np.load(dct_path)).float()
+                # Load with mmap and copy to writable array (fixes PyTorch warning)
+                dct_array = np.load(dct_path, mmap_mode='r')
+                dct_feat = torch.from_numpy(np.array(dct_array, copy=True)).float()
             else:
                 # Fallback: zero tensor
                 dct_feat = torch.zeros(1024)
@@ -83,19 +127,22 @@ class HybridDataset(Dataset):
         return img_tensor, dct_feat, torch.tensor(label, dtype=torch.long)
 
 
-def get_transforms(is_training=True):
+def get_transforms(is_training=True, current_epoch=0, max_epochs=50):
     """
     Get appropriate transforms for training or validation.
     
     Args:
         is_training: If True, include augmentations
+        current_epoch: Current training epoch for progressive JPEG
+        max_epochs: Total epochs for progressive JPEG
     
     Returns:
         torchvision.transforms.Compose object
     """
     if is_training:
-        # Training: with augmentation
+        # Training: with progressive augmentation
         return T.Compose([
+            ProgressiveJpegTransform(current_epoch=current_epoch, max_epochs=max_epochs, prob=0.5),
             T.Resize(256),
             T.RandomCrop(224),
             T.RandomHorizontalFlip(p=0.5),
@@ -115,7 +162,7 @@ def get_transforms(is_training=True):
 
 
 def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0, 
-                       train_ratio=0.8, seed=42):
+                       train_ratio=0.8, seed=42, current_epoch=0, max_epochs=50):
     """
     Create train and validation dataloaders with automatic 80/20 split.
     
@@ -126,6 +173,8 @@ def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0,
         num_workers: Number of workers for data loading (use 0 for ROCm 3.5)
         train_ratio: Ratio of training data (default 0.8 for 80/20 split)
         seed: Random seed for reproducibility
+        current_epoch: Current epoch for progressive augmentation
+        max_epochs: Total epochs for progressive augmentation
     
     Returns:
         train_loader, val_loader
@@ -135,8 +184,15 @@ def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0,
     random.seed(seed)
     np.random.seed(seed)
     
-    # Create full dataset (no transform yet)
-    full_dataset = HybridDataset(root_dir, dct_dir=dct_dir, transform=None, is_training=True)
+    # Create full dataset with progressive transforms
+    full_dataset = HybridDataset(
+        root_dir, 
+        dct_dir=dct_dir, 
+        transform=get_transforms(is_training=True, current_epoch=current_epoch, max_epochs=max_epochs),
+        is_training=True,
+        current_epoch=current_epoch,
+        max_epochs=max_epochs
+    )
     
     # Split into train and validation
     train_size = int(train_ratio * len(full_dataset))
@@ -148,16 +204,14 @@ def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0,
         generator=torch.Generator().manual_seed(seed)
     )
     
-    # Apply transforms
-    train_dataset.dataset.transform = get_transforms(is_training=True)
-    train_dataset.dataset.is_training = True
-    
-    # Create separate dataset for validation with different transform
+    # Create separate dataset for validation with different transform (no augmentation)
     val_dataset_obj = HybridDataset(
         root_dir, 
         dct_dir=dct_dir, 
         transform=get_transforms(is_training=False), 
-        is_training=False
+        is_training=False,
+        current_epoch=current_epoch,
+        max_epochs=max_epochs
     )
     
     # Use the same indices as val_dataset
