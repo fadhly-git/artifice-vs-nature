@@ -14,6 +14,16 @@ import subprocess
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
+# Create log file with timestamp
+LOG_FILE = Path("results") / f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def log_print(message):
+    """Print to terminal and save to log file (without tqdm interference)"""
+    print(message)
+    with open(LOG_FILE, "a") as f:
+        f.write(message + "\n")
+
 # ================== ARGUMENTS ==================
 parser = argparse.ArgumentParser(description='Train Hybrid Detector with on-the-fly preprocessing')
 parser.add_argument('--batch-size', type=int, default=4, help='Batch size per step')
