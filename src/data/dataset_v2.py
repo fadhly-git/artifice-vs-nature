@@ -1,3 +1,6 @@
+# File: src/data/dataset.py
+
+import time
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
@@ -5,18 +8,28 @@ from PIL import Image
 import torchvision.transforms as T
 import numpy as np
 import random
+import scipy.fftpack as fftpack  # For DCT on-the-fly
+import io
+
+import tqdm
+
+class JPEGCompression(object):
+    def __init__(self, quality_range=(70, 100)):
+        self.quality_range = quality_range
+
+    def __call__(self, img):
+        quality = random.randint(*self.quality_range)
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer)
 
 class HybridDataset(Dataset):
-    """
-    Dataset untuk AI-generated image detection dengan preprocessing on-the-fly.
-    
-    Args:
-        root_dir: Path ke folder utama yang berisi subfolder 'real' dan 'fake'
-        dct_dir: Path ke folder berisi file DCT features (.npy)
-        transform: Transformasi untuk training/validation
-        is_training: Boolean untuk menentukan apakah mode training (dengan augmentasi)
-    """
-    def __init__(self, root_dir, dct_dir=None, transform=None, is_training=True):
+    def __init__(self, root_dir, dct_dir=None, transform=None, is_training=True, debug=False):
+        self.debug = debug
+        self.pbar = None
+        if self.debug:
+            print(f"[DEBUG] Dataset init: {root_dir}, training={is_training}")
         self.root_dir = Path(root_dir)
         self.dct_dir = Path(dct_dir) if dct_dir else None
         self.transform = transform
@@ -55,36 +68,68 @@ class HybridDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        img_path = self.samples[idx]
-        label = self.labels[idx]
+        try:
+            img_path = self.samples[idx]
+            label = self.labels[idx]
+            
+            # Load image dengan error handling
+            try:
+                img = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                print(f"❌ Error loading image {img_path}: {e}")
+                # Return dummy data jika corrupt
+                img = Image.new('RGB', (224, 224), color=(128, 128, 128))
+            
+            if self.transform:
+                img = self.transform(img)
+            
+            dct_feat = self._get_dct_feat(img_path, img)
+            
+            return img, dct_feat, torch.tensor(label, dtype=torch.long)
         
-        # Load image
-        img = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"❌ Error in __getitem__ at index {idx}: {e}")
+            # Return dummy batch
+            return (
+                torch.randn(3, 224, 224),
+                torch.randn(1024),
+                torch.tensor(0, dtype=torch.long)
+            )
+    
+    def _get_dct_feat(self, img_path, img_tensor):
+        try:
+            # If DCT dir exists, load .npy
+            if self.dct_dir:
+                dct_path = self.dct_dir / f"{img_path.stem}.npy"
+                if dct_path.exists():
+                    dct_array = np.load(dct_path, mmap_mode='r')
+                    dct_feat = torch.from_numpy(np.array(dct_array, copy=True)).float()
+                    
+                    # 🔧 VALIDASI: Pastikan tidak ada NaN/Inf
+                    if torch.isnan(dct_feat).any() or torch.isinf(dct_feat).any():
+                        print(f"⚠️  Warning: NaN/Inf in DCT file {dct_path}, regenerating...")
+                    else:
+                        return dct_feat
+            
+            # Fallback: Compute DCT on-the-fly
+            img_np = np.array(img_tensor.permute(1, 2, 0) * 255).astype(np.uint8)
+            gray = np.mean(img_np, axis=2)
+            gray_resized = np.array(Image.fromarray(gray.astype(np.uint8)).resize((32, 32)))
+            
+            # 🔧 VALIDASI: Check grayscale
+            if np.isnan(gray_resized).any() or np.isinf(gray_resized).any():
+                print(f"⚠️  Warning: NaN/Inf in grayscale conversion for {img_path}")
+                gray_resized = np.zeros((32, 32))
+            
+            dct = fftpack.dct(fftpack.dct(gray_resized.T, norm='ortho').T, norm='ortho')
+            dct_feat = torch.from_numpy(dct.flatten()[:1024]).float()
+            
+            return dct_feat
         
-        # Apply transform
-        if self.transform:
-            img_tensor = self.transform(img)
-        else:
-            # Default: just convert to tensor
-            img_tensor = T.ToTensor()(img)
-        
-        # Load DCT features if directory provided
-        if self.dct_dir:
-            dct_path = self.dct_dir / f"{img_path.stem}.npy"
-            if dct_path.exists():
-                dct_feat = torch.from_numpy(np.load(dct_path)).float()
-                # Normalize DCT features to prevent gradient explosion
-                # Using approximate mean and std from DCT features (mean~1600, std~200)
-                dct_feat = (dct_feat - 1600.0) / 200.0
-            else:
-                # Fallback: zero tensor
-                dct_feat = torch.zeros(1024)
-        else:
-            # No DCT features: return dummy tensor
-            dct_feat = torch.zeros(1024)
-        
-        return img_tensor, dct_feat, torch.tensor(label, dtype=torch.long)
-
+        except Exception as e:
+            print(f"❌ Error computing DCT for {img_path}: {e}")
+            # Return zero vector if error
+            return torch.zeros(1024, dtype=torch.float32)
 
 def get_transforms(is_training=True):
     """
@@ -116,32 +161,10 @@ def get_transforms(is_training=True):
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-
 def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0, 
-                       train_ratio=0.8, seed=42):
-    """
-    Create train and validation dataloaders with automatic 80/20 split.
+                       train_ratio=0.8, seed=42, debug=False):
+    full_dataset = HybridDataset(root_dir, dct_dir=dct_dir, transform=None, is_training=True, debug=debug)
     
-    Args:
-        root_dir: Path to dataset root (contains 'real' and 'fake' folders)
-        dct_dir: Path to DCT features directory (optional)
-        batch_size: Batch size for dataloaders
-        num_workers: Number of workers for data loading (use 0 for ROCm 3.5)
-        train_ratio: Ratio of training data (default 0.8 for 80/20 split)
-        seed: Random seed for reproducibility
-    
-    Returns:
-        train_loader, val_loader
-    """
-    # Set seed for reproducibility
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    # Create full dataset (no transform yet)
-    full_dataset = HybridDataset(root_dir, dct_dir=dct_dir, transform=None, is_training=True)
-    
-    # Split into train and validation
     train_size = int(train_ratio * len(full_dataset))
     val_size = len(full_dataset) - train_size
     
@@ -151,25 +174,24 @@ def create_dataloaders(root_dir, dct_dir=None, batch_size=4, num_workers=0,
         generator=torch.Generator().manual_seed(seed)
     )
     
+    train_dataset.dataset.debug = debug
+    
     # Apply transforms
     train_dataset.dataset.transform = get_transforms(is_training=True)
     train_dataset.dataset.is_training = True
     
-    # Create separate dataset for validation with different transform
     val_dataset_obj = HybridDataset(
         root_dir, 
         dct_dir=dct_dir, 
-        transform=get_transforms(is_training=False), 
+        transform=get_transforms(is_training=False),
         is_training=False
     )
     
-    # Use the same indices as val_dataset
-    val_samples = [train_dataset.dataset.samples[i] for i in val_dataset.indices]
-    val_labels = [train_dataset.dataset.labels[i] for i in val_dataset.indices]
+    val_samples = [full_dataset.samples[i] for i in val_dataset.indices]
+    val_labels = [full_dataset.labels[i] for i in val_dataset.indices]
     val_dataset_obj.samples = val_samples
     val_dataset_obj.labels = val_labels
     
-    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,

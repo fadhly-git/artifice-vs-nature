@@ -1,3 +1,4 @@
+import datetime
 import os
 import torch
 import torch.nn as nn
@@ -12,15 +13,29 @@ import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
+
+
 # ================== ARGUMENTS ==================
 parser = argparse.ArgumentParser(description='Train Hybrid Detector with on-the-fly preprocessing')
 parser.add_argument('--batch-size', type=int, default=4, help='Batch size per step')
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+parser.add_argument('--model', type=str, default='mobilenet_v3_small', 
+                    choices=['mobilenet_v3_small', 'mobilenet_v3_large', 'mobilenet_v2',
+                             'resnet18', 'resnet34', 'resnet50',
+                             'efficientnet_b0', 'efficientnet_b1'],
+                    help='CNN backbone architecture from torchvision')
 parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
 parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
+parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable mixed precision')
 parser.add_argument('--num-workers', type=int, default=0, help='DataLoader workers (use 0 for ROCm)')
 parser.add_argument('--freeze-cnn', action='store_true', help='Freeze CNN backbone')
+parser.add_argument('--unfreeze-epoch', type=int, default=10, help='Epoch to unfreeze CNN backbone (last block only)')
+parser.add_argument('--unfreeze-all-epoch', type=int, default=15, help='Epoch to unfreeze all CNN layers')
+parser.add_argument('--cnn-lr-ratio', type=float, default=0.01, help='CNN LR ratio when unfrozen')
+parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping max norm')
+parser.add_argument('--shutdown', action='store_true', help='Shutdown system after training completes')
+parser.add_argument('--shutdown-delay', type=int, default=60, help='Shutdown delay in seconds')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
 args = parser.parse_args()
 
@@ -45,9 +60,12 @@ DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "imaginet" / "subset"
 DCT_DIR = PROJECT_ROOT / "data" / "processed" / "imaginet" / "dct_features"  # Optional
 CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
+LOG_DIR = PROJECT_ROOT / "results" / "logs"; LOG_DIR.mkdir(exist_ok=True, parents=True)
+LOG_FILE = LOG_DIR / f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 LATEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_latest.pth"
 BEST_CHECKPOINT = CHECKPOINT_DIR / "hybrid_imaginet_best.pth"
+
+def log(m): print(m); open(LOG_FILE, 'a').write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {m}\n")
 
 # ================== DATASET ==================
 print("\n" + "="*60)
@@ -69,18 +87,28 @@ print("\n" + "="*60)
 print("🤖 INITIALIZING MODEL")
 print("="*60)
 
-model = HybridDetector(num_classes=2, pretrained=True, freeze_cnn=args.freeze_cnn).to(DEVICE)
+model = HybridDetector(
+    num_classes=2, 
+    pretrained=True, 
+    freeze_cnn=args.freeze_cnn,
+    model_name=args.model
+).to(DEVICE)
 
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Model: {trainable:,} trainable / {total:,} total params")
+# Show model info
+model_info = model.get_model_info()
+print(f"Backbone: {model_info['backbone']}")
+print(f"CNN output dim: {model_info['cnn_output_dim']}")
+print(f"Total params: {model_info['total_params']:,}")
+print(f"Trainable params: {model_info['trainable_params']:,}")
+if model_info['frozen_params'] > 0:
+    print(f"Frozen params: {model_info['frozen_params']:,}")
 
 # ================== OPTIMIZER + SCHEDULER ==================
 optimizer = optim.Adam([
     {'params': model.mlp.parameters(), 'lr': args.lr},
     {'params': model.classifier.parameters(), 'lr': args.lr},
-    {'params': model.cnn.parameters(), 'lr': args.lr / 10}
-], lr=args.lr)
+    {'params': model.cnn.parameters(), 'lr': args.lr / 100}
+], lr=args.lr, weight_decay=1e-5, betas=(0.9, 0.999), eps=1e-8)
 
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 scaler = GradScaler() if USE_AMP else None
@@ -104,19 +132,59 @@ if args.resume and LATEST_CHECKPOINT.exists():
 torch.backends.cudnn.benchmark = True
 
 # ================== TRAINING LOOP ==================
-print("\n" + "="*60)
-print("🚀 STARTING TRAINING")
-print("="*60)
-print(f"\nConfig:")
-print(f"   Device: {DEVICE}")
-print(f"   Batch size: {BATCH_SIZE}")
-print(f"   Learning rate: {args.lr}")
-print(f"   Epochs: {EPOCHS}")
-print(f"   Mixed precision: {USE_AMP}")
-print(f"   Seed: {args.seed}")
-print()
+log("\n" + "="*60)
+log("🚀 STARTING TRAINING")
+log("="*60)
+log(f"\nConfig:")
+log(f"   Device: {DEVICE}")
+log(f"   Model: {args.model}")
+log(f"   Batch size: {BATCH_SIZE}")
+log(f"   Learning rate: {args.lr}")
+log(f"   Epochs: {EPOCHS}")
+log(f"   Mixed precision: {USE_AMP}")
+log(f"   Seed: {args.seed}")
+log(f"   Freeze CNN: {args.freeze_cnn}")
+if args.freeze_cnn:
+    log(f"   Unfreeze CNN at epoch: {args.unfreeze_epoch}")
+    log(f"   Unfreeze ALL CNN at epoch: {args.unfreeze_all_epoch}")
+log(f"   Gradient clipping: {args.grad_clip}")
+log(f"   Checkpoints dir: {CHECKPOINT_DIR}")
+log(f"shutdown: {args.shutdown}")
+log("")
 
 for epoch in range(start_epoch, EPOCHS):
+    
+    # Gradual CNN unfreezing strategy
+    if args.freeze_cnn and epoch == args.unfreeze_epoch:
+        log(f"\n🔓 Unfreezing CNN backbone (last block only) at epoch {epoch+1}")
+        
+        # Unfreeze only last block of EfficientNet
+        for name, param in model.cnn.named_parameters():
+            if 'blocks.6' in name or 'conv_head' in name or 'bn2' in name:
+                param.requires_grad = True
+        
+        # Update only the CNN param group LR, don't recreate optimizer
+        cnn_lr = args.lr * args.cnn_lr_ratio
+        optimizer.param_groups[2]['lr'] = cnn_lr
+        
+        log(f"   Last CNN block unfrozen")
+        log(f"   CNN LR: {cnn_lr:.2e}")
+    
+    # Unfreeze all CNN layers at later epoch with CAREFUL learning rate
+    if args.freeze_cnn and epoch == args.unfreeze_all_epoch:
+        log(f"\n🔓 Unfreezing ALL CNN layers at epoch {epoch+1}")
+        
+        for param in model.cnn.parameters():
+            param.requires_grad = True
+        
+        # Use MUCH smaller LR for full CNN unfreezing to prevent gradient explosion
+        # Early layers need very conservative learning rate
+        cnn_lr = args.lr * args.cnn_lr_ratio * 0.1  # 10x smaller than partial unfreeze
+        optimizer.param_groups[2]['lr'] = cnn_lr
+        
+        log(f"   All CNN layers unfrozen")
+        log(f"   CNN LR (conservative): {cnn_lr:.2e}")
+    
     # ========== TRAINING PHASE ==========
     model.train()
     train_loss = 0.0
@@ -137,11 +205,34 @@ for epoch in range(start_epoch, EPOCHS):
             loss = criterion(outputs, labels)
         
         if USE_AMP:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                # ROCm 5.4.3 workaround: sync before backward
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                scaler.scale(loss).backward()
+                
+                # ROCm 5.4.3 workaround: sync after backward
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Gradient clipping to prevent explosion
+                # scaler.unscale_(optimizer)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
         else:
+            # ROCm 5.4.3 workaround: sync before backward
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
             loss.backward()
+            
+            # ROCm 5.4.3 workaround: sync after backward
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            # Gradient clipping for non-AMP training
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
         
         train_loss += loss.item() * labels.size(0)
@@ -158,45 +249,78 @@ for epoch in range(start_epoch, EPOCHS):
     train_loss = train_loss / train_total
     train_acc = 100. * train_correct / train_total
     
+    # Check for NaN loss - stop training if detected
+    if torch.isnan(torch.tensor(train_loss)) or torch.isinf(torch.tensor(train_loss)):
+        log(f"\n❌ NaN/Inf detected in training loss! Stopping training.")
+        log(f"   This usually means gradient explosion occurred.")
+        log(f"   Try: Lower LR, increase gradient clipping, or slower unfreezing schedule")
+        break
+    
     # ========== VALIDATION PHASE ==========
     model.eval()
     val_loss = 0.0
     val_correct = 0
     val_total = 0
     
-    with torch.no_grad():
-        pbar_val = tqdm(val_loader, desc=f"[VAL]   Epoch {epoch+1}/{EPOCHS}", ncols=100)
-        
-        for img_masked, dct_feat, labels in pbar_val:
-            img_masked = img_masked.to(DEVICE, non_blocking=True)
-            dct_feat = dct_feat.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    try:
+        with torch.no_grad():
+            pbar_val = tqdm(val_loader, desc=f"[VAL]   Epoch {epoch+1}/{EPOCHS}", ncols=100)
             
-            with autocast(enabled=USE_AMP):
-                outputs = model(img_masked, dct_feat)
-                loss = criterion(outputs, labels)
-            
-            val_loss += loss.item() * labels.size(0)
-            _, predicted = outputs.max(1)
-            val_total += labels.size(0)
-            val_correct += predicted.eq(labels).sum().item()
-            
-            pbar_val.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*val_correct/val_total:.2f}%'
-            })
+            for batch_idx, (img_masked, dct_feat, labels) in enumerate(pbar_val):
+                # 🔧 FIX: Print progress setiap 10 batch
+                if batch_idx % 10 == 0:
+                    print(f"\nValidation batch {batch_idx}/{len(val_loader)}", flush=True)
+                
+                img_masked = img_masked.to(DEVICE, non_blocking=True)
+                dct_feat = dct_feat.to(DEVICE, non_blocking=True)
+                labels = labels.to(DEVICE, non_blocking=True)
+                
+                with autocast(enabled=USE_AMP):
+                    outputs = model(img_masked, dct_feat)
+                    loss = criterion(outputs, labels)
+                
+                val_loss += loss.item() * labels.size(0)
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+                
+                pbar_val.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{100.*val_correct/val_total:.2f}%'
+                })
+                
+                # 🔧 FIX: Force flush GPU setiap 50 batch
+                if batch_idx % 50 == 0 and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+    except Exception as e:
+        log(f"❌ Validation error: {e}")
+        val_loss = float('inf')
+        val_acc = 0.0
     
     val_loss = val_loss / val_total
     val_acc = 100. * val_correct / val_total
+    
+    # Check for NaN in validation
+    if torch.isnan(torch.tensor(val_loss)) or torch.isinf(torch.tensor(val_loss)):
+        log(f"\n⚠️  NaN/Inf detected in validation loss!")
+        log(f"   Model may have diverged. Consider loading best checkpoint.")
+        # Don't break, but skip checkpoint saving
+        val_loss = float('inf')
+        val_acc = 0.0
     
     # Update learning rate
     scheduler.step()
     
     # ========== LOGGING ==========
-    print(f"\n📊 Epoch {epoch+1}/{EPOCHS} Summary:")
-    print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-    print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
-    print(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
+    log(f"\n📊 Epoch {epoch+1}/{EPOCHS} Summary:")
+    log(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+    log(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+    log(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
     
     # ========== SAVE CHECKPOINTS ==========
     # Save latest checkpoint
@@ -221,7 +345,7 @@ for epoch in range(start_epoch, EPOCHS):
             'val_acc': val_acc,
             'val_loss': val_loss
         }, BEST_CHECKPOINT)
-        print(f"   🌟 New best validation accuracy: {val_acc:.2f}% - Checkpoint saved!")
+        log(f"   🌟 New best validation accuracy: {val_acc:.2f}% - Checkpoint saved!")
     
     print()
     
@@ -230,10 +354,33 @@ for epoch in range(start_epoch, EPOCHS):
         torch.cuda.empty_cache()
 
 # ================== TRAINING COMPLETE ==================
-print("\n" + "="*60)
-print("✅ TRAINING COMPLETE")
-print("="*60)
-print(f"\nBest validation accuracy: {best_val_acc:.2f}%")
-print(f"Checkpoints saved in: {CHECKPOINT_DIR}")
-print(f"   - Latest: {LATEST_CHECKPOINT.name}")
-print(f"   - Best: {BEST_CHECKPOINT.name}")
+log("\n" + "="*60)
+log("✅ TRAINING COMPLETE")
+log("="*60)
+log(f"\nBest validation accuracy: {best_val_acc:.2f}%")
+log(f"Checkpoints saved in: {CHECKPOINT_DIR}")
+log(f"   - Latest: {LATEST_CHECKPOINT.name}")
+log(f"   - Best: {BEST_CHECKPOINT.name}")
+
+import time
+import platform
+# ========== AUTO SHUTDOWN ==========
+if args.shutdown:
+    print("\n🔴 SYSTEM SHUTDOWN SCHEDULED")
+    print(f"   System will shutdown in {args.shutdown_delay} seconds. Press Ctrl+C to cancel.")
+    try:
+        for i in range(args.shutdown_delay, 0, -1):
+            print(f"⏱️  Shutting down in {i} seconds...", end='\r', flush=True)
+            time.sleep(1)
+        print("\nInitiating shutdown...")
+        sys_os = platform.system()
+        if sys_os == "Linux" or sys_os == "Darwin":
+            os.system("sudo shutdown -h now")
+        elif sys_os == "Windows":
+            os.system("shutdown /s /t 0")
+        else:
+            print("❌ Unsupported OS for auto-shutdown.")
+    except KeyboardInterrupt:
+        print("\n❌ Shutdown cancelled by user.")
+else:
+    print("\n✨ Training complete. System will NOT shutdown automatically.")
