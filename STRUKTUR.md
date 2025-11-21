@@ -7,6 +7,7 @@ artifice-vs-nature.git/
 │   ├── 📁 raw/
 │   └── 📁 processed/
 ├── 📁 src/
+├── 📁 scripts/
 ├── 📁 models/
 │   └── 📁 checkpoints/
 ├── 📁 notebooks/

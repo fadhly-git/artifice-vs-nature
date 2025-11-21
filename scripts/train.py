@@ -34,6 +34,8 @@ parser.add_argument('--unfreeze-epoch', type=int, default=10, help='Epoch to unf
 parser.add_argument('--unfreeze-all-epoch', type=int, default=15, help='Epoch to unfreeze all CNN layers')
 parser.add_argument('--cnn-lr-ratio', type=float, default=0.01, help='CNN LR ratio when unfrozen')
 parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping max norm')
+parser.add_argument('--label-smoothing', type=float, default=0.05, help='Label smoothing for CE loss')
+parser.add_argument('--split-file', type=str, default=None, help='Path to save/load dataset split indices (.pt)')
 parser.add_argument('--shutdown', action='store_true', help='Shutdown system after training completes')
 parser.add_argument('--shutdown-delay', type=int, default=60, help='Shutdown delay in seconds')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -79,7 +81,9 @@ train_loader, val_loader = create_dataloaders(
     batch_size=BATCH_SIZE,
     num_workers=args.num_workers,
     train_ratio=0.8,
-    seed=args.seed
+    seed=args.seed,
+    split_file=args.split_file,
+    save_split=True if args.split_file else False
 )
 
 # ================== MODEL ==================
@@ -103,16 +107,27 @@ print(f"Trainable params: {model_info['trainable_params']:,}")
 if model_info['frozen_params'] > 0:
     print(f"Frozen params: {model_info['frozen_params']:,}")
 
+# ================== CLASS WEIGHTS FOR IMBALANCED DATA ==================
+# Calculate class weights from dataset (Real:Fake ratio ~2:1)
+# Weight = 1 / frequency, normalized
+class_counts = torch.tensor([22500.0, 11250.0])  # [Real, Fake] counts
+class_weights = (1.0 / class_counts)
+class_weights = class_weights / class_weights.sum() * 2.0  # Normalize to sum=2
+class_weights = class_weights.to(DEVICE)
+
+print(f"\n⚖️  Class weights: Real={class_weights[0]:.3f}, Fake={class_weights[1]:.3f}")
+
 # ================== OPTIMIZER + SCHEDULER ==================
+cnn_lr = args.lr * args.cnn_lr_ratio
 optimizer = optim.Adam([
     {'params': model.mlp.parameters(), 'lr': args.lr},
     {'params': model.classifier.parameters(), 'lr': args.lr},
-    {'params': model.cnn.parameters(), 'lr': args.lr / 100}
+    {'params': model.cnn.parameters(), 'lr': cnn_lr}
 ], lr=args.lr, weight_decay=1e-5, betas=(0.9, 0.999), eps=1e-8)
 
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
-scaler = GradScaler() if USE_AMP else None
-criterion = nn.CrossEntropyLoss()
+scaler = GradScaler(init_scale=2.0**10, growth_factor=1.5, backoff_factor=0.5, growth_interval=2000) if USE_AMP else None
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
 
 # ================== RESUME ==================
 start_epoch = 0
@@ -129,7 +144,7 @@ if args.resume and LATEST_CHECKPOINT.exists():
         scheduler.load_state_dict(checkpoint['scheduler'])
     print(f"✅ Resumed from epoch {start_epoch}, best val acc: {best_val_acc:.2f}%")
 
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True        
 
 # ================== TRAINING LOOP ==================
 log("\n" + "="*60)
@@ -190,6 +205,8 @@ for epoch in range(start_epoch, EPOCHS):
     train_loss = 0.0
     train_correct = 0
     train_total = 0
+    train_correct_per_class = [0, 0]  # [Real, Fake]
+    train_total_per_class = [0, 0]
     
     pbar = tqdm(train_loader, desc=f"[TRAIN] Epoch {epoch+1}/{EPOCHS}", ncols=100)
     
@@ -205,40 +222,30 @@ for epoch in range(start_epoch, EPOCHS):
             loss = criterion(outputs, labels)
         
         if USE_AMP:
-                # ROCm 5.4.3 workaround: sync before backward
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
                 scaler.scale(loss).backward()
+
+                # Clip gradients with ROCm-safe implementation
+                scaler.unscale_(optimizer)
                 
-                # ROCm 5.4.3 workaround: sync after backward
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
-                # Gradient clipping to prevent explosion
-                # scaler.unscale_(optimizer)
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+
                 scaler.step(optimizer)
                 scaler.update()
         else:
-            # ROCm 5.4.3 workaround: sync before backward
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
             loss.backward()
+
             
-            # ROCm 5.4.3 workaround: sync after backward
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            # Gradient clipping for non-AMP training
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
         
         train_loss += loss.item() * labels.size(0)
         _, predicted = outputs.max(1)
         train_total += labels.size(0)
         train_correct += predicted.eq(labels).sum().item()
+        
+        # Per-class accuracy
+        for c in range(2):
+            mask = labels == c
+            train_total_per_class[c] += mask.sum().item()
+            train_correct_per_class[c] += (predicted[mask] == c).sum().item()
         
         # Update progress bar
         pbar.set_postfix({
@@ -261,6 +268,8 @@ for epoch in range(start_epoch, EPOCHS):
     val_loss = 0.0
     val_correct = 0
     val_total = 0
+    val_correct_per_class = [0, 0]  # [Real, Fake]
+    val_total_per_class = [0, 0]
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -287,6 +296,12 @@ for epoch in range(start_epoch, EPOCHS):
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
+                
+                # Per-class accuracy
+                for c in range(2):
+                    mask = labels == c
+                    val_total_per_class[c] += mask.sum().item()
+                    val_correct_per_class[c] += (predicted[mask] == c).sum().item()
                 
                 pbar_val.set_postfix({
                     'loss': f'{loss.item():.4f}',
@@ -317,10 +332,21 @@ for epoch in range(start_epoch, EPOCHS):
     scheduler.step()
     
     # ========== LOGGING ==========
+    train_acc_real = 100. * train_correct_per_class[0] / train_total_per_class[0] if train_total_per_class[0] > 0 else 0
+    train_acc_fake = 100. * train_correct_per_class[1] / train_total_per_class[1] if train_total_per_class[1] > 0 else 0
+    val_acc_real = 100. * val_correct_per_class[0] / val_total_per_class[0] if val_total_per_class[0] > 0 else 0
+    val_acc_fake = 100. * val_correct_per_class[1] / val_total_per_class[1] if val_total_per_class[1] > 0 else 0
+    
     log(f"\n📊 Epoch {epoch+1}/{EPOCHS} Summary:")
     log(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+    log(f"      Real: {train_acc_real:.2f}% | Fake: {train_acc_fake:.2f}%")
     log(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+    log(f"      Real: {val_acc_real:.2f}% | Fake: {val_acc_fake:.2f}%")
     log(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
+    
+    # Warning if model is collapsing
+    if val_acc_fake < 20.0:
+        log(f"   ⚠️  WARNING: Fake class accuracy very low ({val_acc_fake:.2f}%) - possible collapse!")
     
     # ========== SAVE CHECKPOINTS ==========
     # Save latest checkpoint
